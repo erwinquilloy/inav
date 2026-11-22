@@ -1,0 +1,112 @@
+name: Disarm hold builds
+# Builds every release target of INAV 9.x with osd_msp_disarm_hold, the way INAV's own CI does,
+# and creates one DRAFT release per version. Drafts stay invisible until someone publishes them.
+on:
+  push:
+    branches: [disarm-hold-builds]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.inav.version }} (${{ matrix.job }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        inav:
+          - { version: "9.1.0", commit: e519b69b02e27c8bdc03b4a0889f1baaae211a54 }
+          - { version: "9.0.1", commit: d44f2cf6e60cc9318b10551291b596370b5c957b }
+          - { version: "9.0.0", commit: a7932b92eadd92ba7851a009a5c974b9cc24835d }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: recipe
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: iNavFlight/inav
+          ref: ${{ matrix.inav.commit }}
+          path: inav
+          persist-credentials: false
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get -y install ninja-build
+      - name: Add the disarm hold
+        run: bash recipe/prepare.sh inav ${{ matrix.inav.version }}
+      - name: Build
+        working-directory: inav
+        run: |
+          set -euo pipefail
+          mkdir -p build out
+          cd build
+          cmake -DCI_JOB_INDEX=${{ matrix.job }} -DCI_JOB_COUNT=10 -DMAIN_COMPILE_OPTIONS=-pipe -G Ninja ..
+          # a board without room for the hold must not stop the others; the release job lists it
+          ninja -k 0 -j"$(nproc)" ci || echo "::warning::some targets of this job did not build"
+          rev=$(git rev-parse HEAD | cut -c1-8)
+          shopt -s nullglob
+          for f in inav_*.hex; do
+            cp "$f" "../out/${f%.hex}_dsarmhold_${rev}_UNOFFICIAL.hex"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hex-${{ matrix.inav.version }}-${{ matrix.job }}
+          path: inav/out/*.hex
+          if-no-files-found: warn
+          retention-days: 3
+
+  release:
+    name: draft release ${{ matrix.version }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["9.1.0", "9.0.1", "9.0.0"]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ matrix.version }}
+      TAG: dsarmhold-${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: hexes
+          pattern: hex-${{ matrix.version }}-*
+          merge-multiple: true
+      - name: Create the draft
+        run: |
+          set -euo pipefail
+          key() { tr 'a-z-' 'A-Z_' | sort -u; }
+          gh api "repos/iNavFlight/inav/releases/tags/$VERSION" --jq '.assets[].name | select(endswith(".hex"))' \
+            | sed "s/^inav_${VERSION}_//; s/\.hex$//" | key > official.txt
+          ls hexes | sed "s/^inav_${VERSION}_//; s/_dsarmhold_.*$//" | key > built.txt
+          comm -23 official.txt built.txt > missing.txt
+          echo "official $(wc -l < official.txt), built $(wc -l < built.txt), missing $(wc -l < missing.txt)"
+          cat missing.txt
+          if [ "$(wc -l < missing.txt)" -gt 15 ]; then echo "::error::too many targets missing"; exit 1; fi
+          {
+            echo "**UNOFFICIAL.** INAV $VERSION with one addition: \`osd_msp_disarm_hold\` (0-7 s, default 0 = off). Not made or supported by the INAV team. Test with props off first."
+            echo
+            echo "Source: official INAV $VERSION plus \`disarm_hold_${VERSION}.patch\` (attached). Build recipe: branch \`disarm-hold-builds\`, commit $GITHUB_SHA. License: GPL-3.0."
+            if [ -s missing.txt ]; then
+              echo
+              echo "Not available with the hold in this version:"
+              sed 's/^/- /' missing.txt
+            fi
+          } > notes.md
+          # never overwrite something already published
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::$TAG already exists"; exit 1
+          fi
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --prerelease --latest=false --target "$GITHUB_SHA" \
+            --title "INAV $VERSION + MSP disarm hold (unofficial)" --notes-file notes.md \
+            "patches/disarm_hold_${VERSION}.patch" COPYING
+          cd hexes
+          ls | xargs -n 20 gh release upload "$TAG" -R "$GITHUB_REPOSITORY"

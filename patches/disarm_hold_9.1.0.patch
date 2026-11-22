@@ -1,0 +1,114 @@
+diff --git a/src/main/fc/settings.yaml b/src/main/fc/settings.yaml
+index 4e8affb02..a340ba091 100644
+--- a/src/main/fc/settings.yaml
++++ b/src/main/fc/settings.yaml
+@@ -3851,6 +3851,13 @@ groups:
+         condition: USE_DJI_HD_OSD
+         default_value: OFF
+         type: bool
++      - name: osd_msp_disarm_hold
++        field: msp_disarm_hold
++        description: "Seconds the MSP DisplayPort air unit is still told ARMED after a disarm, so goggles that record only while armed (DJI) also record the stats screen. Only the serial port set to MSP DisplayPort is affected: the flight controller disarms at once, and every other MSP port (mLRS, MSP over telemetry), MAVLink and the configurator see the real arm state. 0 = off."
++        condition: USE_MSP_OSD
++        default_value: 0
++        min: 0
++        max: 7
+       - name: osd_switch_indicator_zero_name
+         description: "Character to use for OSD switch incicator 0."
+         field: osd_switch_indicator0_name
+diff --git a/src/main/io/displayport_msp_osd.c b/src/main/io/displayport_msp_osd.c
+index 6b674a300..a952f2b6c 100644
+--- a/src/main/io/displayport_msp_osd.c
++++ b/src/main/io/displayport_msp_osd.c
+@@ -574,11 +574,62 @@ static mspResult_e fixDjiBrokenO4ProcessMspCommand(mspPacket_t *cmd, mspPacket_t
+ #define fixDjiBrokenO4ProcessMspCommand processMspCommand
+ #endif
+ 
++/*
++ * Disarm hold (osd_msp_disarm_hold, seconds, 0 = off). For that long after a disarm, the status
++ * replies sent on THIS port only (the air unit's MSP DisplayPort UART) still carry the ARM bit, so
++ * goggles that record only while armed also record the stats screen. Nothing else changes: the
++ * flight controller is disarmed at once, and every other MSP user (MSP ports such as mLRS, MSP over
++ * CRSF / SmartPort, MSP in MAVLink, the configurator) is answered by mspFcProcessCommand directly
++ * and sees the real state. The hold starts when this port sees the disarm (the air unit asks
++ * several times a second) and ends early on a re-arm.
++ */
++static bool disarmHoldWasArmed = false;
++static bool disarmHoldActive = false;
++static timeMs_t disarmHoldUntil = 0;
++
++static bool mspOsdDisarmHold(void)
++{
++    if (ARMING_FLAG(ARMED)) {
++        disarmHoldWasArmed = true;
++        disarmHoldActive = false;
++        return false;
++    }
++    const timeMs_t now = millis();
++    if (disarmHoldWasArmed) {
++        disarmHoldWasArmed = false;
++        const uint8_t hold = MIN(osdConfig()->msp_disarm_hold, 7);
++        disarmHoldActive = hold > 0;
++        disarmHoldUntil = now + (timeMs_t)hold * 1000;
++    }
++    if (disarmHoldActive && (int32_t)(now - disarmHoldUntil) >= 0) {
++        disarmHoldActive = false;
++    }
++    return disarmHoldActive;
++}
++
++static mspResult_e disarmHoldProcessMspCommand(mspPacket_t *cmd, mspPacket_t *reply, mspPostProcessFnPtr *mspPostProcessFn)
++{
++    uint8_t * const start = reply->buf.ptr;
++    const mspResult_e result = fixDjiBrokenO4ProcessMspCommand(cmd, reply, mspPostProcessFn);
++    const bool hold = mspOsdDisarmHold();   // every command: notices the disarm even between status requests
++    if (!hold || result != MSP_RESULT_ACK) {
++        return result;
++    }
++    const int len = reply->buf.ptr - start;
++    if ((cmd->cmd == MSP_STATUS || cmd->cmd == MSP_STATUS_EX) && len >= 10) {
++        start[6] |= 0x01;               // mode flags from byte 6, bit 0 = ARM (first active box; DJI order too)
++    } else if (cmd->cmd == MSP2_INAV_STATUS && len >= 14) {
++        start[9] |= (uint8_t)ARMED;     // armingFlags (u32, little-endian) from byte 9
++        start[13] |= 0x01;              // mode flags from byte 13, bit 0 = ARM
++    }
++    return result;
++}
++
+ void mspOsdSerialProcess(mspProcessCommandFnPtr mspProcessCommandFn)
+ {
+     if (mspPort.port) {
+         mspProcessCommand = mspProcessCommandFn;
+-        mspSerialProcessOnePort(&mspPort, MSP_SKIP_NON_MSP_DATA, fixDjiBrokenO4ProcessMspCommand);
++        mspSerialProcessOnePort(&mspPort, MSP_SKIP_NON_MSP_DATA, disarmHoldProcessMspCommand);
+     }
+ }
+ 
+diff --git a/src/main/io/osd.c b/src/main/io/osd.c
+index aa0a01ce7..d53d8de50 100644
+--- a/src/main/io/osd.c
++++ b/src/main/io/osd.c
+@@ -4412,7 +4412,10 @@ PG_RESET_TEMPLATE(osdConfig_t, osdConfig,
+     .stats_page_auto_swap_time = SETTING_OSD_STATS_PAGE_AUTO_SWAP_TIME_DEFAULT,
+     .stats_show_metric_efficiency = SETTING_OSD_STATS_SHOW_METRIC_EFFICIENCY_DEFAULT,
+ 
+-    .radar_peers_display_time = SETTING_OSD_RADAR_PEERS_DISPLAY_TIME_DEFAULT
++    .radar_peers_display_time = SETTING_OSD_RADAR_PEERS_DISPLAY_TIME_DEFAULT,
++#ifdef USE_MSP_OSD
++    .msp_disarm_hold = SETTING_OSD_MSP_DISARM_HOLD_DEFAULT,
++#endif
+ );
+ 
+ void pgResetFn_osdLayoutsConfig(osdLayoutsConfig_t *osdLayoutsConfig)
+diff --git a/src/main/io/osd.h b/src/main/io/osd.h
+index e55aeb224..07a608554 100644
+--- a/src/main/io/osd.h
++++ b/src/main/io/osd.h
+@@ -542,6 +542,7 @@ typedef struct osdConfig_s {
+     uint8_t geozoneDistanceWarning;                     // Distance to fence or action
+     bool geozoneDistanceType;                            // Shows a countdown timer or distance to fence/action
+ #endif
++    uint8_t         msp_disarm_hold;                    // seconds the MSP DisplayPort port still reports ARM after a disarm (0 = off)
+ } osdConfig_t;
+ 
+ PG_DECLARE(osdConfig_t, osdConfig);
