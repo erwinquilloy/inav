@@ -1,6 +1,9 @@
 name: Disarm hold builds
-# Builds every release target of INAV 9.x with osd_msp_disarm_hold, the way INAV's own CI does,
+# Builds every release target of INAV with osd_msp_disarm_hold, the way INAV's own CI does,
 # and creates one DRAFT release per version. Drafts stay invisible until someone publishes them.
+# The matrices list only the versions to build in this run. Already built and released at e247126:
+#   9.1.0 e519b69b02e27c8bdc03b4a0889f1baaae211a54, 9.0.1 d44f2cf6e60cc9318b10551291b596370b5c957b,
+#   9.0.0 a7932b92eadd92ba7851a009a5c974b9cc24835d
 on:
   push:
     branches: [disarm-hold-builds]
@@ -18,9 +21,7 @@ jobs:
       matrix:
         job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         inav:
-          - { version: "9.1.0", commit: e519b69b02e27c8bdc03b4a0889f1baaae211a54 }
-          - { version: "9.0.1", commit: d44f2cf6e60cc9318b10551291b596370b5c957b }
-          - { version: "9.0.0", commit: a7932b92eadd92ba7851a009a5c974b9cc24835d }
+          - { version: "10.0.0-rc2", commit: f1cd5c6f68838227ee4d23e97a44c017849cbb14 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,9 +47,13 @@ jobs:
           # a board without room for the hold must not stop the others; the release job lists it
           ninja -k 0 -j"$(nproc)" ci || echo "::warning::some targets of this job did not build"
           rev=$(git rev-parse HEAD | cut -c1-8)
+          # the build names files after the plain version (inav_10.0.0_X.hex); a release candidate keeps
+          # its full version in the name, like INAV's own release files (inav_10.0.0-rc2_X)
+          ver="${{ matrix.inav.version }}"
           shopt -s nullglob
           for f in inav_*.hex; do
-            cp "$f" "../out/${f%.hex}_dsarmhold_${rev}_UNOFFICIAL.hex"
+            t="${f#inav_${ver%%-*}_}"
+            cp "$f" "../out/inav_${ver}_${t%.hex}_dsarmhold_${rev}_UNOFFICIAL.hex"
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -66,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["9.1.0", "9.0.1", "9.0.0"]
+        version: ["10.0.0-rc2"]
     env:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ matrix.version }}
@@ -93,6 +98,7 @@ jobs:
           if [ "$(wc -l < missing.txt)" -gt 15 ]; then echo "::error::too many targets missing"; exit 1; fi
           {
             echo "**UNOFFICIAL.** INAV $VERSION with one addition: \`osd_msp_disarm_hold\` (0-7 s, default 0 = off). Not made or supported by the INAV team. Test with props off first."
+            case "$VERSION" in *-rc*) echo; echo "INAV $VERSION is a release candidate, not a final INAV release.";; esac
             echo
             echo "Source: official INAV $VERSION plus \`disarm_hold_${VERSION}.patch\` (attached). Build recipe: branch \`disarm-hold-builds\`, commit $GITHUB_SHA. License: GPL-3.0."
             if [ -s missing.txt ]; then

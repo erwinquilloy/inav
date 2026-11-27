@@ -1,6 +1,6 @@
 # INAV + MSP DisplayPort disarm hold (unofficial builds)
 
-Build recipe for INAV 9.0.0, 9.0.1 and 9.1.0 with one addition, `osd_msp_disarm_hold`.
+Build recipe for INAV 9.0.0, 9.0.1, 9.1.0 and 10.0.0-rc2 with one addition, `osd_msp_disarm_hold`.
 Not made or supported by the INAV team.
 
 The hold keeps telling the MSP DisplayPort air unit "armed" for 0-7 seconds after a disarm, so
